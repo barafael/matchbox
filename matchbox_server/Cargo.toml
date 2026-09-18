@@ -13,8 +13,11 @@ categories = [
   "web-programming",
 ]
 repository = "https://github.com/johanhelsing/matchbox"
-homepage = "https://github.com/johanhelsing/matchbox"
 readme = "../README.md"
+
+[[bin]]
+name = "matchbox-server"
+path = "src/main.rs"
 
 [dependencies]
 matchbox_signaling = { version = "0.15", path = "../matchbox_signaling" }

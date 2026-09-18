@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "simple-example"
+path = "src/main.rs"
+
 [dependencies]
 matchbox_socket = { path = "../../matchbox_socket" }
 futures-timer = { version = "3", features = ["wasm-bindgen"] }

@@ -1,7 +1,4 @@
-use bevy::{
-    prelude::{Command, Commands, Resource, World},
-    tasks::IoTaskPool,
-};
+use bevy::prelude::{Command, Commands, Resource, World};
 pub use matchbox_socket;
 use matchbox_socket::{MessageLoopFuture, WebRtcSocket, WebRtcSocketBuilder};
 use std::ops::{Deref, DerefMut};
@@ -121,7 +118,7 @@ fn spawn_message_loop(fut: MessageLoopFuture) {
 
 #[cfg(target_arch = "wasm32")]
 fn spawn_message_loop(fut: MessageLoopFuture) {
-    let task_pool = IoTaskPool::get();
+    let task_pool = bevy::tasks::IoTaskPool::get();
     task_pool.spawn(fut).detach();
 }
 

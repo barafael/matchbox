@@ -40,14 +40,12 @@ once_cell = { version = "1.21", default-features = false, features = [
   "alloc",
 ] }
 derive_more = { version = "2.1", features = ["display", "from"] }
-tokio-util = { version = "0.7", features = ["io", "compat"] }
 
 ggrs = { version = "0.13", default-features = false, optional = true }
 bincode = { version = "2.0", default-features = false, features = [
   "serde",
   "alloc",
 ], optional = true }
-bytes = { version = "1.12", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ggrs = { version = "0.13", default-features = false, optional = true, features = [
@@ -85,6 +83,7 @@ async-tungstenite = { version = "0.32", default-features = false, features = [
 ] }
 webrtc = { version = "0.17", default-features = false }
 async-compat = { version = "0.2", default-features = false }
+bytes = { version = "1.12", default-features = false }
 
 [dev-dependencies]
 futures-test = "0.3"
