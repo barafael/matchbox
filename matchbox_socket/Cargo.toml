@@ -35,11 +35,11 @@ log = { version = "0.4", default-features = false }
 thiserror = "2.0"
 cfg-if = "1.0"
 async-trait = "0.1"
-once_cell = { version = "1.17", default-features = false, features = [
+once_cell = { version = "1.21", default-features = false, features = [
   "race",
   "alloc",
 ] }
-derive_more = { version = "2.0", features = ["display", "from"] }
+derive_more = { version = "2.1", features = ["display", "from"] }
 tokio-util = { version = "0.7", features = ["io", "compat"] }
 
 ggrs = { version = "0.13", default-features = false, optional = true }
@@ -47,7 +47,7 @@ bincode = { version = "2.0", default-features = false, features = [
   "serde",
   "alloc",
 ], optional = true }
-bytes = { version = "1.1", default-features = false }
+bytes = { version = "1.12", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ggrs = { version = "0.13", default-features = false, optional = true, features = [
@@ -60,7 +60,7 @@ futures-timer = { version = "3.0", default-features = false, features = [
   "wasm-bindgen",
 ] }
 js-sys = { version = "0.3", default-features = false }
-web-sys = { version = "0.3.22", default-features = false, features = [
+web-sys = { version = "0.3.105", default-features = false, features = [
   "MessageEvent",
   "RtcConfiguration",
   "RtcDataChannel",

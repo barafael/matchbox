@@ -29,7 +29,7 @@ signaling = [
 ]
 
 [dependencies]
-bevy = { version = "0.19.0", default-features = false, features = [
+bevy = { version = "0.19.1", default-features = false, features = [
   "async_executor",
 ] }
 matchbox_socket = { version = "0.15", path = "../matchbox_socket" }
@@ -42,7 +42,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
-bevy = { version = "0.19.0", default-features = false, features = [
+bevy = { version = "0.19.1", default-features = false, features = [
   "bevy_winit",
   "bevy_window",
   "bevy_render",
