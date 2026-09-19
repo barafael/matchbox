@@ -11,7 +11,11 @@ use self::error::SignalingError;
 use crate::{Error, webrtc_socket::signal_peer::SignalPeer};
 use async_trait::async_trait;
 use cfg_if::cfg_if;
-use futures::{Future, FutureExt, StreamExt, future::Either, stream::FuturesUnordered};
+use futures::{
+    Future, FutureExt, StreamExt,
+    future::{Either, FusedFuture},
+    stream::{Fuse, FuturesUnordered},
+};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_timer::Delay;
 use futures_util::select;
@@ -22,7 +26,12 @@ pub(crate) use socket::MessageLoopChannels;
 pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
-use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -87,14 +96,10 @@ pub trait Signaller: Sync + Send + 'static {
 }
 
 async fn signaling_loop(
-    builder: Arc<dyn SignallerBuilder>,
-    attempts: Option<u16>,
-    room_url: String,
+    mut signaller: Box<dyn Signaller>,
     mut requests_receiver: futures_channel::mpsc::UnboundedReceiver<PeerRequest>,
     events_sender: futures_channel::mpsc::UnboundedSender<PeerEvent>,
 ) -> Result<(), SignalingError> {
-    let mut signaller = builder.new_signaller(attempts, room_url).await?;
-
     loop {
         select! {
             request = requests_receiver.next().fuse() => {
@@ -170,6 +175,44 @@ trait Messenger {
     async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId;
 }
 
+/// The next signaling event, or `None` once the signaling loop has ended.
+///
+/// A fused wrapper around the signaling event channel. After the channel
+/// closes, this future yields `None` once, then stays pending forever and
+/// reports [`FusedFuture::is_terminated`], so a [`select!`] arm polling it
+/// is skipped. This is what allows the message loop to outlive the
+/// signaling loop; simply polling the channel would resolve immediately on
+/// every poll after closure.
+struct SignalingEvents {
+    stream: Fuse<UnboundedReceiver<PeerEvent>>,
+    terminated: bool,
+}
+
+impl Future for SignalingEvents {
+    type Output = Option<PeerEvent>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.terminated {
+            return Poll::Pending;
+        }
+        match this.stream.poll_next_unpin(cx) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(event)),
+            Poll::Ready(None) => {
+                this.terminated = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl FusedFuture for SignalingEvents {
+    fn is_terminated(&self) -> bool {
+        self.terminated
+    }
+}
+
 async fn message_loop<M: Messenger>(
     id_tx: futures_channel::oneshot::Sender<PeerId>,
     ice_server_config: &RtcIceServerConfig,
@@ -179,7 +222,7 @@ async fn message_loop<M: Messenger>(
 ) -> Result<(), SignalingError> {
     let MessageLoopChannels {
         requests_sender,
-        mut events_receiver,
+        events_receiver,
         mut peer_messages_out_rx,
         messages_from_peers_tx,
         peer_state_tx,
@@ -198,6 +241,20 @@ async fn message_loop<M: Messenger>(
     }
     .fuse();
 
+    // The next signaling event. This future yields the events of the
+    // signaling channel one by one; when the channel closes (the signaling
+    // loop ended), it yields `None` once, then stays pending and reports
+    // `is_terminated`, so the events arm of the select below is skipped
+    // from then on. That is what lets the message loop outlive the
+    // signaling loop: established peer connections do not need signaling,
+    // and polling a closed channel through a recreated fused future would
+    // resolve immediately on every pass through the select, busy-looping
+    // the socket task.
+    let mut signaling_events = SignalingEvents {
+        stream: events_receiver.fuse(),
+        terminated: false,
+    };
+
     loop {
         let mut next_peer_messages_out = peer_messages_out_rx
             .iter_mut()
@@ -210,8 +267,12 @@ async fn message_loop<M: Messenger>(
         select! {
             _  = &mut timeout => {
                 if requests_sender.unbounded_send(PeerRequest::KeepAlive).is_err() {
-                    // socket dropped
-                    break Ok(());
+                    // The signaling loop is gone; keep-alives exist to keep
+                    // the signaling websocket alive, so there is nothing
+                    // left to send them to. Existing peer connections are
+                    // unaffected. Do not break: the socket stays alive on
+                    // its data channels.
+                    debug!("cannot send keep-alive: signaling connection is gone");
                 }
                 if let Some(interval) = keep_alive_interval {
                     timeout = Either::Left(Delay::new(interval)).fuse();
@@ -220,40 +281,56 @@ async fn message_loop<M: Messenger>(
                 }
             }
 
-            message = events_receiver.next().fuse() => {
-                if let Some(event) = message {
-                    debug!("{event:?}");
-                    match event {
-                        PeerEvent::IdAssigned(peer_uuid) => {
-                            if id_tx.take().expect("already sent peer id").send(peer_uuid.to_owned()).is_err() {
-                                // Socket receiver was dropped, exit cleanly.
-                                break Ok(());
-                            };
-                        },
-                        PeerEvent::NewPeer(peer_uuid) => {
-                            let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
-                            handshake_signals.insert(peer_uuid, signal_tx);
-                            let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs))
-                        },
-                        PeerEvent::PeerLeft(peer_uuid) => {
-                            if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
-                                // socket dropped, exit cleanly
-                                break Ok(());
-                            }
-                        },
-                        PeerEvent::Signal { sender, data } => {
-                            let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
-                                let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
-                                let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs));
-                                from_peer_tx
-                            });
+            event = &mut signaling_events => {
+                match event {
+                    Some(event) => {
+                        debug!("{event:?}");
+                        match event {
+                            PeerEvent::IdAssigned(peer_uuid) => {
+                                if id_tx.take().expect("already sent peer id").send(peer_uuid.to_owned()).is_err() {
+                                    // Socket receiver was dropped, exit cleanly.
+                                    break Ok(());
+                                };
+                            },
+                            PeerEvent::NewPeer(peer_uuid) => {
+                                let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
+                                handshake_signals.insert(peer_uuid, signal_tx);
+                                let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
+                                handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs))
+                            },
+                            PeerEvent::PeerLeft(peer_uuid) => {
+                                if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
+                                    // socket dropped, exit cleanly
+                                    break Ok(());
+                                }
+                            },
+                            PeerEvent::Signal { sender, data } => {
+                                let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
+                                    let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
+                                    let signal_peer = SignalPeer::new(sender, requests_sender.clone());
+                                    handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs));
+                                    from_peer_tx
+                                });
 
-                            if signal_tx.unbounded_send(data).is_err() {
-                                warn!("ignoring signal from peer {sender} because the handshake has already finished");
-                            }
-                        },
+                                if signal_tx.unbounded_send(data).is_err() {
+                                    warn!("ignoring signal from peer {sender} because the handshake has already finished");
+                                }
+                            },
+                        }
+                    }
+                    None => {
+                        // The signaling loop ended (server restart, lost
+                        // websocket, ...). This is not fatal: established
+                        // peer connections live entirely on the data
+                        // channels and keep working; only new handshakes
+                        // are impossible until the application rebuilds
+                        // the socket. `signaling_events` has become
+                        // terminated, so this arm is disabled from here on.
+                        warn!(
+                            "signaling connection lost; keeping existing peer \
+                            connections, but no new peers can join until the \
+                            socket is rebuilt"
+                        );
                     }
                 }
             }

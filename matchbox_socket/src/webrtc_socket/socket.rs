@@ -11,8 +11,10 @@ use crate::{
 };
 
 use futures::{Future, FutureExt, Sink, Stream, StreamExt, future::Fuse, select};
-use futures_channel::mpsc::{SendError, TryRecvError, TrySendError, UnboundedReceiver, UnboundedSender};
-use log::{debug, error};
+use futures_channel::mpsc::{
+    SendError, TryRecvError, TrySendError, UnboundedReceiver, UnboundedSender,
+};
+use log::{debug, error, info, warn};
 use matchbox_protocol::PeerId;
 use std::{collections::HashMap, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
@@ -722,16 +724,18 @@ async fn run_socket(
 ) -> Result<(), SignalingError> {
     debug!("Starting WebRtcSocket");
 
+    // Connect to the signaling server before anything else: a failure here
+    // means no room was ever joined and no data channel exists, so the error
+    // must still surface to the caller (as `Error::ConnectionFailed` /
+    // `Error::Disconnected` on the message loop future).
+    let signaller = builder
+        .new_signaller(config.attempts, config.room_url)
+        .await?;
+
     let (requests_sender, requests_receiver) = futures_channel::mpsc::unbounded::<PeerRequest>();
     let (events_sender, events_receiver) = futures_channel::mpsc::unbounded::<PeerEvent>();
 
-    let signaling_loop_fut = signaling_loop(
-        builder,
-        config.attempts,
-        config.room_url,
-        requests_receiver,
-        events_sender,
-    );
+    let signaling_loop_fut = signaling_loop(signaller, requests_receiver, events_sender);
 
     let channels = MessageLoopChannels {
         requests_sender,
@@ -759,7 +763,6 @@ async fn run_socket(
                         break Ok(())
                     },
                     Err(e) => {
-                        // TODO: Reconnect X attempts if configured to reconnect.
                         error!("The message loop finished with an error: {e:?}");
                         break Err(e);
                     },
@@ -767,17 +770,24 @@ async fn run_socket(
             }
 
             sigloop = signaling_loop_done => {
+                // A signaling failure after the initial connection is not
+                // fatal: established peer connections live entirely on
+                // WebRTC data channels and do not involve the signaling
+                // server anymore. Keep the message loop (and with it every
+                // peer connection) running; only new handshakes are
+                // impossible until the application rebuilds the socket.
+                // (Reconnecting the websocket would not restore them either:
+                // rooms live in the server's memory.) This arm selects on a
+                // fused future, so once the signaling loop has ended, the
+                // arm stays disabled; the message loop observes the same
+                // event through its events channel closing.
                 match sigloop {
-                    Ok(()) => debug!("Signaling loop completed"),
-                    Err(SignalingError::StreamExhausted) => {
-                        debug!("Signaling loop completed");
-                        break Ok(());
-                    },
-                    Err(e) => {
-                        // TODO: Reconnect X attempts if configured to reconnect.
-                        error!("The signaling loop finished with an error: {e:?}");
-                        break Err(e);
-                    },
+                    Ok(()) => info!("Signaling loop completed"),
+                    Err(e) => warn!(
+                        "Signaling loop finished with an error: {e:?}; \
+                        keeping existing peer connections, but no new peers \
+                        can join until the socket is rebuilt"
+                    ),
                 }
             }
 
@@ -788,7 +798,94 @@ async fn run_socket(
 
 #[cfg(test)]
 mod test {
-    use crate::{ChannelConfig, ChannelError, Error, WebRtcSocket, WebRtcSocketBuilder};
+    use super::{Packet, PeerEvent, PeerRequest, SignalingError, SocketConfig, run_socket};
+    use crate::{
+        ChannelConfig, ChannelError, Error, WebRtcSocket, WebRtcSocketBuilder,
+        webrtc_socket::{Signaller, SignallerBuilder},
+    };
+    use futures::future::poll_fn;
+    use futures_channel::mpsc;
+    use matchbox_protocol::PeerId;
+    use std::{sync::Arc, task::Poll};
+
+    /// A signaller whose websocket connection dies immediately, simulating a
+    /// signaling server that goes away right after a successful connect.
+    #[derive(Debug)]
+    struct DyingSignaller;
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl Signaller for DyingSignaller {
+        async fn send(&mut self, _request: PeerRequest) -> Result<(), SignalingError> {
+            Ok(())
+        }
+
+        async fn next_message(&mut self) -> Result<PeerEvent, SignalingError> {
+            Err(SignalingError::UserImplementationError(
+                "websocket died".into(),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct DyingSignallerBuilder;
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl SignallerBuilder for DyingSignallerBuilder {
+        async fn new_signaller(
+            &self,
+            _attempts: Option<u16>,
+            _room_url: String,
+        ) -> Result<Box<dyn Signaller>, SignalingError> {
+            Ok(Box::new(DyingSignaller))
+        }
+    }
+
+    /// After a successful initial connect, a signaling loop failure must not
+    /// tear down the socket: established peer connections live on WebRTC
+    /// data channels. The message loop future must stay alive (pending) and
+    /// only complete -- successfully -- once the application drops the
+    /// socket, instead of completing with an error.
+    #[futures_test::test]
+    async fn signaling_failure_mid_session_is_not_fatal() {
+        let (id_tx, _id_rx) = futures_channel::oneshot::channel();
+        let (peer_messages_out_tx, peer_messages_out_rx) = mpsc::unbounded::<(PeerId, Packet)>();
+        let (peer_state_tx, _peer_state_rx) = mpsc::unbounded();
+        let (messages_from_peers_tx, _messages_from_peers_rx) = mpsc::unbounded();
+
+        let config = SocketConfig {
+            room_url: "wss://irrelevant.invalid".into(),
+            ice_server: Default::default(),
+            channels: vec![ChannelConfig::reliable()],
+            attempts: Some(1),
+            keep_alive_interval: None,
+        };
+
+        let mut fut = Box::pin(run_socket(
+            Arc::new(DyingSignallerBuilder),
+            id_tx,
+            config,
+            vec![peer_messages_out_rx],
+            peer_state_tx,
+            vec![messages_from_peers_tx],
+        ));
+
+        // The signaling loop fails on the first poll, but the socket stays
+        // alive: the future must be pending, not resolved with an error.
+        let first_poll: Poll<Result<(), SignalingError>> =
+            poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+        assert!(
+            matches!(first_poll, Poll::Pending),
+            "socket future resolved on first poll: {first_poll:?}"
+        );
+
+        // Dropping the socket (the outgoing message channel) ends the
+        // message loop cleanly -- with `Ok`, not a signaling error.
+        drop(peer_messages_out_tx);
+        let result = fut.await;
+        assert!(matches!(result, Ok(())));
+    }
 
     #[futures_test::test]
     async fn unreachable_server() {
