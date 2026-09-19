@@ -13,7 +13,7 @@ use async_compat::CompatExt;
 use async_trait::async_trait;
 use async_tungstenite::{
     WebSocketStream,
-    async_std::{ConnectStream, connect_async},
+    smol::{ConnectStream, connect_async},
     tungstenite::Message,
 };
 use bytes::Bytes;
