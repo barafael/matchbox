@@ -19,7 +19,7 @@ ggrs = ["dep:bincode", "dep:ggrs"]
 
 [dependencies]
 matchbox_protocol = { version = "0.15", path = "../matchbox_protocol", default-features = false }
-futures-channel = { version = "0.3", default-features = false, features = [
+futures-channel = { version = "0.3.32", default-features = false, features = [
   "sink",
 ] }
 futures = { version = "0.3", default-features = false }
