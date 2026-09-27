@@ -38,5 +38,9 @@ tokio-stream = "0.1"
 [dev-dependencies]
 tokio-tungstenite = "0.28"
 
-[lints]
-workspace = true
+# Not inherited from the workspace: the Dockerfile builds this crate outside of it.
+[lints.clippy]
+# The connection-request callback returns matchbox_signaling's large `Err` (an axum `Response`).
+result_large_err = "allow"
+# Predates the lint.
+collapsible_match = "allow"
