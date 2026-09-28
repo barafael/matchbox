@@ -320,12 +320,21 @@ async fn message_loop<M: Messenger>(
                     }
                     None => {
                         // The signaling loop ended (server restart, lost
-                        // websocket, ...). This is not fatal: established
-                        // peer connections live entirely on the data
-                        // channels and keep working; only new handshakes
-                        // are impossible until the application rebuilds
-                        // the socket. `signaling_events` has become
-                        // terminated, so this arm is disabled from here on.
+                        // websocket, ...). This is not fatal while peers are
+                        // connected: their connections live entirely on the
+                        // data channels and keep working; only new handshakes
+                        // are impossible until the application rebuilds the
+                        // socket. `signaling_events` has become terminated,
+                        // so this arm is disabled from here on.
+                        //
+                        // With no peer connected, though, there is nothing
+                        // left to keep alive, and a socket that can never
+                        // gain a peer must end, so that the application
+                        // learns the signaling server is gone (e.g. a player
+                        // waiting for a match) instead of waiting forever.
+                        if peer_loops.is_empty() {
+                            break Err(SignalingError::StreamExhausted);
+                        }
                         warn!(
                             "signaling connection lost; keeping existing peer \
                             connections, but no new peers can join until the \
@@ -349,6 +358,11 @@ async fn message_loop<M: Messenger>(
                 if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
                     break Ok(());
+                }
+                if signaling_events.terminated && peer_loops.is_empty() {
+                    // The last peer is gone and, without signaling, no new
+                    // one can join: end the socket (see the `None` arm above).
+                    break Err(SignalingError::StreamExhausted);
                 }
             }
 
