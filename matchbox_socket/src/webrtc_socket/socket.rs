@@ -491,7 +491,7 @@ impl WebRtcSocket {
     }
 
     /// Similar to [`WebRtcSocket::update_peers`]. Will instead return a Result::Err if the
-    /// socket is closed.
+    /// socket is closed, once every change received before the closure has been returned.
     pub fn try_update_peers(&mut self) -> Result<Vec<(PeerId, PeerState)>, ChannelError> {
         let mut changes = Vec::new();
         loop {
@@ -502,8 +502,13 @@ impl WebRtcSocket {
                         changes.push((id, state));
                     }
                 }
-                Err(TryRecvError::Closed) => return Err(ChannelError::Closed),
-                Err(TryRecvError::Empty) => break,
+                // Report the changes received before the closure first (the last
+                // peer's disconnect often arrives together with it); the next call
+                // reports the closure.
+                Err(TryRecvError::Closed) if changes.is_empty() => {
+                    return Err(ChannelError::Closed);
+                }
+                Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
             }
         }
 
