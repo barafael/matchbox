@@ -1,11 +1,11 @@
 use async_compat::CompatExt;
 use bevy::{
     prelude::{Command, Commands, Resource},
-    tasks::IoTaskPool,
+    tasks::{IoTaskPool, Task},
 };
 pub use matchbox_signaling;
 use matchbox_signaling::{
-    SignalingCallbacks, SignalingServer, SignalingServerBuilder, SignalingState,
+    Error, SignalingCallbacks, SignalingServer, SignalingServerBuilder, SignalingState,
     topologies::{
         SignalingTopology,
         client_server::{ClientServer, ClientServerCallbacks, ClientServerState},
@@ -63,7 +63,10 @@ use std::net::SocketAddr;
 /// }
 /// ```
 #[derive(Debug, Resource)]
-pub struct MatchboxServer;
+// The serve task is owned rather than detached: dropping it cancels the server, on every target
+// since Bevy 0.19, which is what makes removing the resource stop it.
+#[allow(dead_code)]
+pub struct MatchboxServer(Task<Result<(), Error>>);
 
 impl<Topology, Cb, S> From<SignalingServerBuilder<Topology, Cb, S>> for MatchboxServer
 where
@@ -79,8 +82,8 @@ where
 impl From<SignalingServer> for MatchboxServer {
     fn from(server: SignalingServer) -> Self {
         let task_pool = IoTaskPool::get();
-        task_pool.spawn(server.serve().compat()).detach();
-        MatchboxServer
+        let task = task_pool.spawn(server.serve().compat());
+        MatchboxServer(task)
     }
 }
 

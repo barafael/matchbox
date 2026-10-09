@@ -133,7 +133,7 @@ pub fn setup_scene(
             ))
             // ...just ensure you add a `Rollback` component
             // This ensures a stable ID is available for the rollback system to refer to
-            .insert(Rollback::default());
+            .insert(Rollback);
     }
 
     // light

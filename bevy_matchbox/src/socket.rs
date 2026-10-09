@@ -1,11 +1,23 @@
-use bevy::prelude::{Command, Commands, Resource, World};
+use bevy::{
+    prelude::{Command, Commands, Resource, World},
+    tasks::{IoTaskPool, Task},
+};
 pub use matchbox_socket;
-use matchbox_socket::{MessageLoopFuture, WebRtcSocket, WebRtcSocketBuilder};
-use std::ops::{Deref, DerefMut};
+use matchbox_socket::{Error, MessageLoopFuture, WebRtcSocket, WebRtcSocketBuilder};
+use std::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    future::poll_fn,
+    sync::{Arc, Mutex, PoisonError},
+    task::{Poll, ready},
+};
 
-/// A [`WebRtcSocket`] as a Bevy [`Resource`].
+/// A [`WebRtcSocket`] as a [`Resource`].
 ///
-/// Open with [`Commands`]:
+/// With [`Commands`]
 /// ```
 /// use bevy_matchbox::prelude::*;
 /// use bevy::prelude::*;
@@ -20,7 +32,7 @@ use std::ops::{Deref, DerefMut};
 /// }
 /// ```
 ///
-/// Or insert directly:
+/// Directly
 /// ```
 /// use bevy_matchbox::prelude::*;
 /// use bevy::prelude::*;
@@ -40,7 +52,10 @@ use std::ops::{Deref, DerefMut};
 /// }
 /// ```
 #[derive(Resource, Debug)]
-pub struct MatchboxSocket(WebRtcSocket);
+// The message loop is owned rather than detached: dropping it ends the loop, which is what makes
+// removing the resource close the socket.
+#[allow(dead_code)]
+pub struct MatchboxSocket(WebRtcSocket, MessageLoop);
 
 impl Deref for MatchboxSocket {
     type Target = WebRtcSocket;
@@ -64,62 +79,75 @@ impl From<WebRtcSocketBuilder> for MatchboxSocket {
 
 impl From<(WebRtcSocket, MessageLoopFuture)> for MatchboxSocket {
     fn from((socket, message_loop_fut): (WebRtcSocket, MessageLoopFuture)) -> Self {
-        spawn_message_loop(message_loop_fut);
-        MatchboxSocket(socket)
+        MatchboxSocket(socket, MessageLoop::spawn(message_loop_fut))
     }
 }
 
-/// Spawn the matchbox message-loop future so it keeps running for the lifetime
-/// of the socket.
+/// The message loop of a [`MatchboxSocket`], running on the [`IoTaskPool`].
 ///
-/// On native, `webrtc-rs` (used by `matchbox_socket`) depends on a live tokio
-/// runtime for timers and I/O. `matchbox_socket` wraps its handshake futures
-/// in `async-compat`, which enters a global single-threaded tokio context —
-/// but that fallback runtime's timer is not sufficient for webrtc-rs 0.17's
-/// DTLS/SCTP handshake to complete when polled from Bevy's `IoTaskPool`
-/// (async-executor). The result: ICE connects but data channels never open,
-/// so `PeerState::Connected` is never emitted and peers never see each other.
-///
-/// Spawning directly on a real multi-threaded tokio runtime fixes this.
-///
-/// On WASM there is no tokio and no webrtc-rs (the browser provides WebRTC),
-/// so we fall back to `IoTaskPool::spawn(…).detach()` as before.
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_message_loop(fut: MessageLoopFuture) {
-    use std::sync::OnceLock;
-    use tokio::runtime::Runtime;
-    use tokio::task::JoinHandle;
-
-    /// A global multi-threaded tokio runtime dedicated to the matchbox message
-    /// loop. Created once, reused for every socket (reconnects, etc.).
-    static MATCHBOX_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-    let runtime = MATCHBOX_RUNTIME.get_or_init(|| {
-        // webrtc-rs uses rustls for DTLS. rustls 0.23 requires a process-level
-        // CryptoProvider to be installed before any config is built. When the
-        // message loop ran through async-compat's fallback runtime this was set
-        // up implicitly; on a fresh tokio runtime we must install it ourselves.
-        // webrtc-rs pulls in `ring`, so use the ring provider.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("matchbox")
-            .build()
-            .expect("failed to build matchbox tokio runtime")
-    });
-
-    // Detach the JoinHandle so it runs in the background. The runtime lives for
-    // 'static and the task will complete when the socket closes.
-    let _handle: JoinHandle<()> = runtime.spawn(async move {
-        let _ = fut.await;
-    });
+/// The task is owned rather than detached, and dropping this ends the loop: that is what makes
+/// removing the resource close the socket.
+struct MessageLoop {
+    // Never read, only held: dropping a task cancels it.
+    #[allow(dead_code)]
+    task: Task<Result<(), Error>>,
+    /// The loop itself, shared with `task`, which polls it through this slot.
+    ///
+    /// Cancelling a task only asks its executor to drop the future, whenever it next gets to it.
+    /// With Bevy's single-threaded task pool, that executor is a thread local of the main thread,
+    /// ticked once per frame; after the app's last frame, the cancelled loop sits in it until the
+    /// thread-local destructors run at process exit. By then tokio's thread-local context is gone,
+    /// and the loop's webrtc futures cannot be dropped without it (async-compat enters the tokio
+    /// runtime to drop them), so the process aborts on its way out. Taking the loop out of this
+    /// slot in [`Drop`] ends it right away instead, on the thread dropping the socket.
+    #[cfg(not(target_arch = "wasm32"))]
+    future: Arc<Mutex<Option<MessageLoopFuture>>>,
 }
 
-#[cfg(target_arch = "wasm32")]
-fn spawn_message_loop(fut: MessageLoopFuture) {
-    let task_pool = bevy::tasks::IoTaskPool::get();
-    task_pool.spawn(fut).detach();
+impl MessageLoop {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn(future: MessageLoopFuture) -> Self {
+        let future = Arc::new(Mutex::new(Some(future)));
+        let slot = Arc::clone(&future);
+        let task = IoTaskPool::get().spawn(poll_fn(move |cx| {
+            let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(future) = slot.as_mut() else {
+                // The socket was dropped, and took the loop with it.
+                return Poll::Ready(Ok(()));
+            };
+            let result = ready!(future.as_mut().poll(cx));
+            *slot = None;
+            Poll::Ready(result)
+        }));
+        Self { task, future }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn(future: MessageLoopFuture) -> Self {
+        Self {
+            task: IoTaskPool::get().spawn(future),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for MessageLoop {
+    fn drop(&mut self) {
+        // Take the loop out under the lock, but drop it only after releasing the lock, so that a
+        // concurrent poll of the task on another thread is not held up by the loop's teardown.
+        let future = self
+            .future
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(future);
+    }
+}
+
+impl fmt::Debug for MessageLoop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageLoop").finish_non_exhaustive()
+    }
 }
 
 /// A [`Command`] used to open a [`MatchboxSocket`] and allocate it as a resource.
@@ -179,7 +207,7 @@ impl MatchboxSocket {
     /// fn open_channel_system(mut commands: Commands) {
     ///     let room_url = "wss://matchbox.example.com";
     ///     let socket = MatchboxSocket::new_unreliable(room_url);
-    ///     commands.spawn(socket);
+    ///     commands.insert_resource(socket);
     /// }
     /// ```
     pub fn new_unreliable(room_url: impl Into<String>) -> MatchboxSocket {
@@ -195,10 +223,79 @@ impl MatchboxSocket {
     /// fn open_channel_system(mut commands: Commands) {
     ///     let room_url = "wss://matchbox.example.com";
     ///     let socket = MatchboxSocket::new_reliable(room_url);
-    ///     commands.spawn(socket);
+    ///     commands.insert_resource(socket);
     /// }
     /// ```
     pub fn new_reliable(room_url: impl Into<String>) -> MatchboxSocket {
         Self::from(WebRtcSocket::new_reliable(room_url))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::{prelude::App, tasks::TaskPoolBuilder};
+    use matchbox_socket::ChannelConfig;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    /// Sets a flag when dropped, so a cancelled future is observable.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The real message loop is discarded: what is under test is what owning the task
+    /// buys, not connecting to anything.
+    fn socket_watching_its_loop(dropped: Arc<AtomicBool>) -> MatchboxSocket {
+        let (socket, _real_loop) = WebRtcSocketBuilder::new("ws://localhost:1/drop_test")
+            .add_channel(ChannelConfig::reliable())
+            .build();
+
+        // Captured rather than created in the async block, so that dropping the loop sets the
+        // flag even if the loop was never polled.
+        let flag = DropFlag(dropped);
+        let watched: MessageLoopFuture = Box::pin(async move {
+            let _flag = flag;
+            std::future::pending().await
+        });
+
+        MatchboxSocket::from((socket, watched))
+    }
+
+    /// The socket owns its message loop rather than detaching it, so dropping the resource
+    /// ends the loop. Detached, the loop would outlive every socket and `close_socket` would
+    /// be a rename of `remove_resource`.
+    ///
+    /// The loop must be gone by the time the resource is: leaving it to the executor to drop
+    /// the cancelled task is not enough. Nothing ticks this app's task pool (nor, with Bevy's
+    /// single-threaded pool, an app that has exited), which is exactly when a deferred drop
+    /// ends up in the thread-local destructors and aborts the process.
+    #[test]
+    fn closing_the_socket_ends_its_message_loop() {
+        // No worker threads: with the multi-threaded pool too, nothing ever runs the task, so a
+        // loop left to the executor would never be dropped, deterministically.
+        IoTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(0).build());
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut app = App::new();
+        app.insert_resource(socket_watching_its_loop(dropped.clone()));
+
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the message loop runs while the socket holds it"
+        );
+
+        app.world_mut().remove_resource::<MatchboxSocket>();
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "removing the socket must drop its message loop, not leave it to the executor"
+        );
     }
 }

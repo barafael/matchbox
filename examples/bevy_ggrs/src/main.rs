@@ -1,4 +1,8 @@
-use bevy::{log::LogPlugin, prelude::*, text::{FontSource, FontSize}};
+use bevy::{
+    log::LogPlugin,
+    prelude::*,
+    text::{FontSize, FontSource},
+};
 use bevy_ggrs::prelude::*;
 use bevy_matchbox::prelude::*;
 
@@ -59,10 +63,10 @@ fn main() {
 fn start_matchbox_socket(mut commands: Commands, args: Res<Args>) {
     let room_id = match &args.room {
         Some(id) => id.clone(),
-        None => format!("bevy_ggrs?next={}", &args.players),
+        None => format!("bevy_ggrs?next={}", args.players),
     };
 
-    let room_url = format!("{}/{}", &args.matchbox, room_id);
+    let room_url = format!("{}/{}", args.matchbox, room_id);
     info!("connecting to matchbox server: {room_url:?}");
 
     commands.insert_resource(MatchboxSocket::new_unreliable(room_url));

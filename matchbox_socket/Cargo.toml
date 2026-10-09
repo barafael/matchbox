@@ -16,10 +16,13 @@ repository = "https://github.com/johanhelsing/matchbox"
 
 [features]
 ggrs = ["dep:bincode", "dep:ggrs"]
+# Lets native `wss://` signaling reach servers (or proxies) that only speak TLS 1.2; without
+# it the native TLS stack is TLS 1.3-only. Browsers do their own TLS, so no effect on wasm.
+tls12 = ["dep:rustls", "rustls/tls12"]
 
 [dependencies]
 matchbox_protocol = { version = "0.15", path = "../matchbox_protocol", default-features = false }
-futures-channel = { version = "0.3", default-features = false, features = [
+futures-channel = { version = "0.3.32", default-features = false, features = [
   "sink",
 ] }
 futures = { version = "0.3", default-features = false }
@@ -35,11 +38,11 @@ log = { version = "0.4", default-features = false }
 thiserror = "2.0"
 cfg-if = "1.0"
 async-trait = "0.1"
-once_cell = { version = "1.21", default-features = false, features = [
+once_cell = { version = "1.17", default-features = false, features = [
   "race",
   "alloc",
 ] }
-derive_more = { version = "2.1", features = ["display", "from"] }
+derive_more = { version = "2.0", features = ["display", "from"] }
 
 ggrs = { version = "0.13", default-features = false, optional = true }
 bincode = { version = "2.0", default-features = false, features = [
@@ -58,7 +61,7 @@ futures-timer = { version = "3.0", default-features = false, features = [
   "wasm-bindgen",
 ] }
 js-sys = { version = "0.3", default-features = false }
-web-sys = { version = "0.3.105", default-features = false, features = [
+web-sys = { version = "0.3.22", default-features = false, features = [
   "MessageEvent",
   "RtcConfiguration",
   "RtcDataChannel",
@@ -82,8 +85,11 @@ async-tungstenite = { version = "0.35", default-features = false, features = [
   "futures-rustls-webpki-roots",
 ] }
 webrtc = { version = "0.17", default-features = false }
+# Only for the `tls12` feature: async-tungstenite builds futures-rustls without default
+# features, which leaves rustls without TLS 1.2. The crypto provider (ring) comes from webrtc.
+rustls = { version = "0.23", default-features = false, optional = true }
 async-compat = { version = "0.2", default-features = false }
-bytes = { version = "1.12", default-features = false }
+bytes = { version = "1.1", default-features = false }
 
 [dev-dependencies]
 futures-test = "0.3"

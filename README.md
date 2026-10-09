@@ -17,13 +17,16 @@ The Matchbox project contains:
 
 - [matchbox_socket](https://github.com/johanhelsing/matchbox/tree/main/matchbox_socket): A socket abstraction for Wasm or Native, with:
   - `ggrs`: A feature providing a [ggrs](https://github.com/gschup/ggrs) compatible socket.
+  - `tls12`: Lets native `wss://` signaling connect to servers that only support TLS 1.2 (native connections are TLS 1.3-only without it).
 - [matchbox_signaling](https://github.com/johanhelsing/matchbox/tree/main/matchbox_signaling): A signaling server library, with ready to use examples
 - [matchbox_server](https://github.com/johanhelsing/matchbox/tree/main/matchbox_server): A ready to use full-mesh signalling server
 - [bevy_matchbox](https://github.com/johanhelsing/matchbox/tree/main/bevy_matchbox): A `matchbox_socket` integration for the [Bevy](https://bevyengine.org/) game engine
 
   | bevy  | bevy_matchbox |
   | ----- | ------------- |
-  | 0.18  | 0.14, main    |
+  | 0.20  | 0.15, main    |
+  | 0.19  | 0.15          |
+  | 0.18  | 0.14          |
   | 0.17  | 0.13          |
   | 0.16  | 0.12          |
   | 0.15  | 0.11          |
