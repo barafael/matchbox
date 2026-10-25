@@ -136,57 +136,24 @@ pub struct FullMeshState {
 impl SignalingState for FullMeshState {}
 
 impl FullMeshState {
-    /// Add a peer, returning peers that already existed
+    /// Add a peer to its room, telling the peers already in it of the newcomer.
+    ///
+    /// Joining the room and reading who is in it happen under one lock: two peers joining at
+    /// the same moment must each be told of the other by whichever joined second. Read and
+    /// joined under separate locks, both could find the room without the other, and neither
+    /// would ever hear of the other. Sending doesn't block (an unbounded channel), so it may
+    /// happen under the lock.
     pub fn add_peer(&mut self, peer: PeerId, sender: SignalingChannel, room: String) {
-        // Alert all peers of new user
         let event = Message::Text(JsonPeerEvent::NewPeer(peer).to_string().into());
-
-        // Create the room if needed
-        if !self
-            .state
-            .lock()
-            .as_ref()
-            .unwrap()
-            .rooms
-            .contains_key(&room)
-        {
-            self.state
-                .lock()
-                .as_mut()
-                .unwrap()
-                .rooms
-                .insert(room.clone(), HashMap::new());
-        }
-
-        // Safety: Lock must be scoped/dropped to ensure no deadlock with loop
-        // let rooms = { self.peers.lock().unwrap().clone() };
-        let state = { self.state.lock().unwrap().clone() };
-        // let rooms = self.peers.lock();
-        state.rooms.iter().for_each(|(name, peers)| {
-            if *name == room {
-                peers.keys().for_each(|peer_id| {
-                    if let Err(e) = self.try_send_to_peer(*peer_id, event.clone(), room.clone()) {
-                        error!("error sending to {peer_id}: {e:?}");
-                    }
-                });
+        let mut state = self.state.lock().unwrap();
+        let peers = state.rooms.entry(room.clone()).or_default();
+        for (peer_id, other) in peers.iter() {
+            if let Err(e) = try_send(other, event.clone()) {
+                error!("error sending to {peer_id}: {e:?}");
             }
-        });
-
-        // Safety: All prior locks in this method must be freed prior to this call
-        self.state
-            .lock()
-            .as_mut()
-            .unwrap()
-            .rooms
-            .get_mut(&room)
-            .unwrap()
-            .insert(peer, sender);
-        self.state
-            .lock()
-            .as_mut()
-            .unwrap()
-            .peers
-            .insert(peer, room.clone());
+        }
+        peers.insert(peer, sender);
+        state.peers.insert(peer, room);
     }
 
     /// Remove a peer from the state if it existed, returning the peer removed.

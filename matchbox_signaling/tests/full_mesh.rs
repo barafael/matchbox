@@ -97,6 +97,72 @@ mod tests {
         assert_eq!(new_peer_event, JsonPeerEvent::NewPeer(b_uuid));
     }
 
+    /// Peers joining a room at the same moment each learn of every other: of each pair, the one
+    /// that joined first is told of the second. Many rounds of many simultaneous joins, as a
+    /// race between two joins finds no peer told of the other only now and then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn simultaneous_joins_meet() {
+        const PEERS: usize = 16;
+        const ROUNDS: usize = 20;
+        let mut server = SignalingServer::full_mesh_builder((Ipv4Addr::LOCALHOST, 0)).build();
+        let addr = server.bind().unwrap();
+        tokio::spawn(server.serve());
+
+        for round in 0..ROUNDS {
+            let room = format!("ws://{addr}/round_{round}");
+            // Every client in its own task, so the server handles the joins at once.
+            let (told_tx, mut told_rx) = unbounded_channel::<(PeerId, PeerId)>();
+            let (ids_tx, mut ids_rx) = unbounded_channel::<PeerId>();
+            let clients: Vec<_> = (0..PEERS)
+                .map(|_| {
+                    let (room, told_tx, ids_tx) = (room.clone(), told_tx.clone(), ids_tx.clone());
+                    tokio::spawn(async move {
+                        let (mut client, _response) =
+                            tokio_tungstenite::connect_async(room).await.unwrap();
+                        let me = get_peer_id(recv_peer_event(&mut client).await);
+                        ids_tx.send(me).unwrap();
+                        while let Some(Ok(message)) = client.next().await {
+                            if let Ok(JsonPeerEvent::NewPeer(other)) =
+                                JsonPeerEvent::from_str(&message.to_string())
+                            {
+                                told_tx.send((me, other)).unwrap();
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let mut ids = Vec::new();
+            while ids.len() < PEERS {
+                ids.push(ids_rx.recv().await.unwrap());
+            }
+            let pairs = PEERS * (PEERS - 1) / 2;
+            let mut told = Vec::new();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while told.len() < pairs {
+                match tokio::time::timeout_at(deadline, told_rx.recv()).await {
+                    Ok(Some(pair)) => told.push(pair),
+                    _ => break,
+                }
+            }
+            for (i, a) in ids.iter().enumerate() {
+                for b in &ids[i + 1..] {
+                    let times = told
+                        .iter()
+                        .filter(|&&(to, of)| (to, of) == (*a, *b) || (to, of) == (*b, *a))
+                        .count();
+                    assert_eq!(
+                        times, 1,
+                        "round {round}: {a} and {b} told of each other {times} times"
+                    );
+                }
+            }
+            for client in clients {
+                client.abort();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn disconnect_peer() {
         let mut server = SignalingServer::full_mesh_builder((Ipv4Addr::LOCALHOST, 0)).build();
